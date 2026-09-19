@@ -20,6 +20,40 @@ namespace Lidgren.Network
 		private const string c_readOverflowError = "Trying to read past the buffer size - likely caused by mismatching Write/Reads, different size or order.";
 		private const int c_stackallocThresh = 1024;
 
+		private bool CanReadBytes(int numberOfBytes, bool allowPartialFinalByte = true)
+		{
+			if (numberOfBytes < 0 || m_readPosition < 0 || m_bitLength < 0)
+				return false;
+
+			long remainingBits = (long)m_bitLength - m_readPosition;
+			if (remainingBits < 0)
+				return false;
+
+			long requiredBits = (long)numberOfBytes * 8L;
+			long nextReadPosition = (long)m_readPosition + requiredBits;
+
+			// m_readPosition is an int, so never accept a read whose resulting
+			// position would overflow even if the backing bit length is near Int32.MaxValue.
+			if (nextReadPosition > int.MaxValue)
+				return false;
+
+			return allowPartialFinalByte
+				? remainingBits + 7L >= requiredBits
+				: remainingBits >= requiredBits;
+		}
+
+		private bool CanReadBits(int numberOfBits)
+		{
+			if (numberOfBits < 0 || m_readPosition < 0 || m_bitLength < 0)
+				return false;
+
+			long remainingBits = (long)m_bitLength - m_readPosition;
+			long nextReadPosition = (long)m_readPosition + numberOfBits;
+
+			return remainingBits >= numberOfBits &&
+			       nextReadPosition <= int.MaxValue;
+		}
+
 		/// <summary>
 		/// Reads a boolean value (stored as a single bit) written using Write(bool)
 		/// </summary>
@@ -82,7 +116,7 @@ namespace Lidgren.Network
 		/// </summary>
 		public Span<byte> ReadBytes(Span<byte> into)
 		{
-			NetException.Assert(m_bitLength - m_readPosition + 7 >= (into.Length * 8), c_readOverflowError);
+			NetException.Assert(CanReadBytes(into.Length), c_readOverflowError);
 
 			NetBitWriter.ReadBytes(Data, m_readPosition, into);
 			m_readPosition += (8 * into.Length);
@@ -94,6 +128,9 @@ namespace Lidgren.Network
 		/// </summary>
 		public byte[] ReadBytes(int numberOfBytes)
 		{
+			// A network-controlled length must be validated before allocation.
+			NetException.Assert(CanReadBytes(numberOfBytes), c_readOverflowError);
+
 			var retVal = new byte[numberOfBytes];
 			ReadBytes(retVal);
 			return retVal;
@@ -104,7 +141,7 @@ namespace Lidgren.Network
 		/// </summary>
 		public bool ReadBytes(int numberOfBytes, [MaybeNullWhen(false)] out byte[] result)
 		{
-			if (m_bitLength - m_readPosition + 7 < (numberOfBytes * 8))
+			if (!CanReadBytes(numberOfBytes))
 			{
 				result = null;
 				return false;
@@ -121,7 +158,7 @@ namespace Lidgren.Network
 		/// </summary>
 		public bool TryReadBytes(Span<byte> into)
 		{
-			if (m_bitLength - m_readPosition + 7 < (into.Length * 8))
+			if (!CanReadBytes(into.Length))
 			{
 				return false;
 			}
@@ -139,8 +176,12 @@ namespace Lidgren.Network
 		/// <param name="numberOfBytes">The number of bytes to read</param>
 		public void ReadBytes(byte[] into, int offset, int numberOfBytes)
 		{
-			NetException.Assert(m_bitLength - m_readPosition + 7 >= (numberOfBytes * 8), c_readOverflowError);
-			NetException.Assert(offset + numberOfBytes <= into.Length);
+			NetException.Assert(CanReadBytes(numberOfBytes), c_readOverflowError);
+			NetException.Assert(
+				offset >= 0 &&
+				numberOfBytes >= 0 &&
+				offset <= into.Length &&
+				numberOfBytes <= into.Length - offset);
 
 			NetBitWriter.ReadBytes(Data, numberOfBytes, m_readPosition, into, offset);
 			m_readPosition += (8 * numberOfBytes);
@@ -154,8 +195,10 @@ namespace Lidgren.Network
 		/// <param name="numberOfBits">The number of bits to read</param>
 		public void ReadBits(Span<byte> into, int numberOfBits)
 		{
-			NetException.Assert(m_bitLength - m_readPosition >= numberOfBits, c_readOverflowError);
-			NetException.Assert(NetUtility.BytesToHoldBits(numberOfBits) <= into.Length);
+			NetException.Assert(CanReadBits(numberOfBits), c_readOverflowError);
+
+			long requiredBytes = ((long)numberOfBits + 7L) / 8L;
+			NetException.Assert(requiredBytes <= into.Length);
 
 			int numberOfWholeBytes = numberOfBits / 8;
 			int extraBits = numberOfBits - (numberOfWholeBytes * 8);
@@ -394,19 +437,30 @@ namespace Lidgren.Network
 		[CLSCompliant(false)]
 		public uint ReadVariableUInt32()
 		{
-			int num1 = 0;
-			int num2 = 0;
-			while (m_bitLength - m_readPosition >= 8)
+			uint result = 0;
+
+			// A UInt32 varint can contain at most five bytes.
+			// Bounding the loop prevents malformed continuation bytes from turning
+			// a tiny field into a scan across the entire network message.
+			for (int i = 0; i < 5; i++)
 			{
-				byte num3 = this.ReadByte();
-				num1 |= (num3 & 0x7f) << num2;
-				num2 += 7;
-				if ((num3 & 0x80) == 0)
-					return (uint)num1;
+				if (m_bitLength - m_readPosition < 8)
+					return result;
+
+				byte value = ReadByte();
+
+				// The fifth byte may only contain bits 28..31. Continuation or any
+				// higher payload bits would overflow UInt32.
+				if (i == 4 && (value & 0xF0) != 0)
+					throw new NetException("Malformed variable UInt32.");
+
+				result |= (uint)(value & 0x7F) << (i * 7);
+
+				if ((value & 0x80) == 0)
+					return result;
 			}
 
-			// ouch; failed to find enough bytes; malformed variable length number?
-			return (uint)num1;
+			throw new NetException("Malformed variable UInt32.");
 		}
 
 		/// <summary>
@@ -415,24 +469,26 @@ namespace Lidgren.Network
 		[CLSCompliant(false)]
 		public bool ReadVariableUInt32(out uint result)
 		{
-			int num1 = 0;
-			int num2 = 0;
-			while (m_bitLength - m_readPosition >= 8)
+			result = 0;
+
+			for (int i = 0; i < 5; i++)
 			{
-				if (ReadByte(out byte num3) == false)
+				if (!ReadByte(out byte value))
+					return false;
+
+				if (i == 4 && (value & 0xF0) != 0)
 				{
 					result = 0;
 					return false;
 				}
-				num1 |= (num3 & 0x7f) << num2;
-				num2 += 7;
-				if ((num3 & 0x80) == 0)
-				{
-					result = (uint)num1;
+
+				result |= (uint)(value & 0x7F) << (i * 7);
+
+				if ((value & 0x80) == 0)
 					return true;
-				}
 			}
-			result = (uint)num1;
+
+			result = 0;
 			return false;
 		}
 
@@ -460,22 +516,28 @@ namespace Lidgren.Network
 		[CLSCompliant(false)]
 		public ulong ReadVariableUInt64()
 		{
-			ulong num1 = 0;
-			int num2 = 0;
-			while (m_bitLength - m_readPosition >= 8)
-			{
-				//if (num2 == 0x23)
-				//	throw new FormatException("Bad 7-bit encoded integer");
+			ulong result = 0;
 
-				byte num3 = this.ReadByte();
-				num1 |= ((ulong)num3 & 0x7f) << num2;
-				num2 += 7;
-				if ((num3 & 0x80) == 0)
-					return num1;
+			// A UInt64 varint can contain at most ten bytes.
+			for (int i = 0; i < 10; i++)
+			{
+				if (m_bitLength - m_readPosition < 8)
+					return result;
+
+				byte value = ReadByte();
+
+				// The tenth byte may only carry bit 63. Any other payload bit or a
+				// continuation bit would overflow UInt64.
+				if (i == 9 && (value & 0xFE) != 0)
+					throw new NetException("Malformed variable UInt64.");
+
+				result |= (ulong)(value & 0x7F) << (i * 7);
+
+				if ((value & 0x80) == 0)
+					return result;
 			}
 
-			// ouch; failed to find enough bytes; malformed variable length number?
-			return num1;
+			throw new NetException("Malformed variable UInt64.");
 		}
 
 		/// <summary>
@@ -553,22 +615,27 @@ namespace Lidgren.Network
 		/// </summary>
 		public string ReadString()
 		{
-			int byteLen = (int)ReadVariableUInt32();
+			uint encodedByteLen = ReadVariableUInt32();
 
-			if (byteLen <= 0)
+			if (encodedByteLen == 0)
 				return string.Empty;
 
-			if ((ulong)(m_bitLength - m_readPosition) < ((ulong)byteLen * 8))
+			// Validate the unsigned wire length before casting to int and before
+			// performing any allocation or length arithmetic.
+			if (encodedByteLen > int.MaxValue ||
+				!CanReadBytes((int)encodedByteLen, allowPartialFinalByte: false))
 			{
-				// not enough data
+				// not enough data / malformed length
 #if DEBUG
 
 				throw new NetException(c_readOverflowError);
 #else
 				m_readPosition = m_bitLength;
-				return ""; // unfortunate; but we need to protect against DDOS
+				return ""; // protect against malformed network input / DDOS
 #endif
 			}
+
+			int byteLen = (int)encodedByteLen;
 
 			if ((m_readPosition & 7) == 0)
 			{
@@ -606,13 +673,22 @@ namespace Lidgren.Network
 				return false;
 			}
 
-			if (byteLen <= 0)
+			if (byteLen == 0)
 			{
 				result = string.Empty;
 				return true;
 			}
 
-			if (m_bitLength - m_readPosition < (byteLen * 8))
+			// byteLen is network-controlled. Do not evaluate byteLen * 8 in uint:
+			// sufficiently large values can overflow and bypass the old bounds check.
+			if (byteLen > int.MaxValue)
+			{
+				result = string.Empty;
+				return false;
+			}
+
+			int length = (int)byteLen;
+			if (!CanReadBytes(length, allowPartialFinalByte: false))
 			{
 				result = string.Empty;
 				return false;
@@ -626,14 +702,14 @@ namespace Lidgren.Network
 				}
 
 				// read directly
-				result = System.Text.Encoding.UTF8.GetString(m_data, m_readPosition >> 3, (int)byteLen);
-				m_readPosition += (8 * (int)byteLen);
+				result = System.Text.Encoding.UTF8.GetString(m_data, m_readPosition >> 3, length);
+				m_readPosition += (8 * length);
 				return true;
 			}
 
-			if (byteLen < c_stackallocThresh)
+			if (length < c_stackallocThresh)
 			{
-				Span<byte> spanBytes = stackalloc byte[(int)byteLen];
+				Span<byte> spanBytes = stackalloc byte[length];
 
 				if (TryReadBytes(spanBytes))
 				{
@@ -645,7 +721,7 @@ namespace Lidgren.Network
 				return false;
 			}
 
-			if (ReadBytes((int)byteLen, out byte[]? bytes) == false)
+			if (ReadBytes(length, out byte[]? bytes) == false)
 			{
 				result = string.Empty;
 				return false;
